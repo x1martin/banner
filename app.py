@@ -1,30 +1,26 @@
 import os
 from io import BytesIO
-import asyncio
-import aiohttp
+import requests
 from flask import Flask, send_file, jsonify, request
+from cachetools import TTLCache
 
 app = Flask(__name__)
 
-# ইন-মেমোরি ক্যাশ ডিকশনারি (Fastest Cache Method for Async)
-PLAYER_CACHE = {}
-BANNER_CACHE = {}
+# গ্লোবাল সেশন (Keep-Alive এনাবল করবে, যার ফলে স্পিড ৩ গুণ বেড়ে যাবে)
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+})
 
-# গ্লোবাল অ্যাসিনক্রোনাস সেশন
-async_session = None
+# ৫ মিনিটের জন্য প্লেয়ার ডেটা মেমোরিতে ক্যাশ থাকবে (সর্বোচ্চ ১০০০ জন প্লেয়ার)
+player_cache = TTLCache(maxsize=1000, ttl=300)
 
-async def get_session():
-    global async_session
-    if async_session is None or async_session.closed:
-        # Keep-Alive এবং ফাস্ট কানেকশন পুলিং সেটআপ
-        connector = aiohttp.TCPConnector(limit=100, ttl_dns_cache=300)
-        async_session = aiohttp.ClientSession(connector=connector)
-    return async_session
+# ১০ মিনিটের জন্য ব্যানার ইমেজ মেমোরিতে ক্যাশ থাকবে (সর্বোচ্চ ৫০০টি ইমেজ)
+image_cache = TTLCache(maxsize=500, ttl=600)
 
-async def fetch_player_data(uid_or_name):
-    # ক্যাশে থাকলে সেখান থেকে ১ মিলি-সেকেন্ডে রিটার্ন করবে
-    if uid_or_name in PLAYER_CACHE:
-        return PLAYER_CACHE[uid_or_name]
+def fetch_player_data(uid_or_name):
+    if uid_or_name in player_cache:
+        return player_cache[uid_or_name]
 
     url = (
         f"https://info.killersharmabot.online/player-info?uid={uid_or_name}"
@@ -32,20 +28,21 @@ async def fetch_player_data(uid_or_name):
         else f"https://info.killersharmabot.online/player-info?name={uid_or_name}"
     )
     
-    session = await get_session()
     try:
-        async with session.get(url, timeout=4) as response:
-            if response.status == 200:
-                data = await response.json()
-                if data.get("basicInfo"):
-                    # ৫ মিনিটের জন্য ক্যাশে সেভ করে রাখছি
-                    PLAYER_CACHE[uid_or_name] = data
-                    return data
-    except Exception:
-        pass
-    return None
+        r = session.get(url, timeout=4)
+        if r.status_code != 200:
+            return None
 
-async def fetch_banner_image(player_data):
+        data = r.json()
+        if not data.get("basicInfo"):
+            return None
+            
+        player_cache[uid_or_name] = data
+        return data
+    except Exception:
+        return None
+
+def fetch_banner_image(player_data):
     basic = player_data.get("basicInfo", {})
     clan = player_data.get("clanBasicInfo", {})
 
@@ -55,10 +52,10 @@ async def fetch_banner_image(player_data):
     nickname = basic.get("nickname", "").replace("#", "%23").replace("&", "%26")
     clan_name = clan.get("clanName", "").replace("#", "%23").replace("&", "%26")
 
-    # ইউনিক ক্যাশ কি (Cache Key) তৈরি
-    cache_key = f"{basic.get('headPic','')}_{basic.get('bannerId','')}_{nickname}_{clan_name}"
-    if cache_key in BANNER_CACHE:
-        return BANNER_CACHE[cache_key]
+    cache_key = f"{basic.get('headPic','')}_{basic.get('bannerId','')}_{nickname}_{clan_name}_{prime_level}"
+    
+    if cache_key in image_cache:
+        return image_cache[cache_key]
 
     url = (
         "https://image.killersharmabot.online/banner-image?"
@@ -73,14 +70,12 @@ async def fetch_banner_image(player_data):
         f"&frame={frame}"
     )
 
-    session = await get_session()
     try:
-        async with session.get(url, timeout=5) as response:
-            if response.status == 200:
-                img_data = await response.read()
-                # ইমেজটি ক্যাশে সেভ করা হচ্ছে
-                BANNER_CACHE[cache_key] = img_data
-                return img_data
+        r = session.get(url, timeout=5)
+        if r.status_code == 200:
+            img_content = r.content
+            image_cache[cache_key] = img_content
+            return img_content
     except Exception:
         pass
     return None
@@ -94,24 +89,16 @@ def banner_image():
     if not search:
         return jsonify({"error": "Missing uid or name"}), 400
 
-    # Flask সিঙ্ক হওয়ায় অ্যাসিনক্রোনাস ফাংশনগুলোকে ইভেন্ট লুপ দিয়ে রান করানো হচ্ছে
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    try:
-        player = loop.run_until_complete(fetch_player_data(search))
-        if not player:
-            return jsonify({"error": "Player not found"}), 404
+    player = fetch_player_data(search)
+    if not player:
+        return jsonify({"error": "Player not found"}), 404
 
-        img = loop.run_until_complete(fetch_banner_image(player))
-        if not img:
-            return jsonify({"error": "Failed to generate banner"}), 500
-    finally:
-        loop.close()
+    img = fetch_banner_image(player)
+    if not img:
+        return jsonify({"error": "Failed to generate banner"}), 500
 
-    # ব্রাউজার লেভেলে ক্যাশ কন্ট্রোল যুক্ত করা হয়েছে যাতে ইউজারের ফোনও স্পিড পায়
     response = send_file(BytesIO(img), mimetype="image/png")
-    response.headers["Cache-Control"] = "public, max-age=86400" # ২৪ ঘণ্টা ব্রাউজারে সেভ থাকবে
+    response.headers["Cache-Control"] = "public, max-age=86400"
     return response
 
 if __name__ == "__main__":
