@@ -1,3 +1,4 @@
-Flask
-requests
-gunicorn
+Flask==3.0.2
+requests==2.31.0
+cachetools==5.3.3
+urllib3==2.2.1
